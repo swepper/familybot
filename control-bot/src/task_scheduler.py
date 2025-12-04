@@ -1,0 +1,415 @@
+import os
+import logging
+from datetime import datetime, time, date, timedelta
+from src.database import get_db_connection
+from src.telegram_api import send_telegram_message, create_inline_keyboard
+
+logger = logging.getLogger(__name__)
+
+class TaskScheduler:
+    @staticmethod
+    def assign_daily_tasks():
+        """Автоматическая выдача ежедневных заданий всем детям"""
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        try:
+            logger.info("Starting daily tasks assignment...")
+            
+            # Получаем всех активных администраторов
+            cur.execute("""
+                SELECT DISTINCT t.created_by, u.full_name as admin_name
+                FROM tasks t
+                JOIN users u ON t.created_by = u.user_id
+                WHERE t.type = 'daily' 
+                AND t.is_active = TRUE
+                AND u.role = 'admin'
+            """)
+            admins = cur.fetchall()
+            
+            if not admins:
+                logger.info("No admins with active daily tasks found")
+                return 0
+            
+            total_assigned = 0
+            admin_results = []
+            today = date.today()
+            
+            for admin_id, admin_name in admins:
+                try:
+                    assigned, children_notified = TaskScheduler._assign_admin_daily_tasks(admin_id, admin_name, cur, today)
+                    total_assigned += assigned
+                    
+                    if assigned > 0:
+                        admin_results.append({
+                            'admin_id': admin_id,
+                            'admin_name': admin_name,
+                            'tasks_assigned': assigned,
+                            'children_notified': children_notified
+                        })
+                        
+                        logger.info(f"Admin {admin_name} ({admin_id}): {assigned} tasks assigned, {children_notified} children notified")
+                        
+                except Exception as e:
+                    logger.error(f"Error assigning tasks for admin {admin_id} ({admin_name}): {e}")
+            
+            # Логируем результат
+            try:
+                cur.execute("""
+                    INSERT INTO task_assignment_logs 
+                    (task_type, assigned_count, success_count, error_count)
+                    VALUES ('daily', %s, %s, %s)
+                """, (total_assigned, len(admin_results), len(admins) - len(admin_results)))
+            except Exception as e:
+                logger.warning(f"Could not log to task_assignment_logs: {e}")
+            
+            conn.commit()
+            logger.info(f"Daily tasks assignment completed: {total_assigned} tasks assigned by {len(admin_results)}/{len(admins)} admins")
+            
+            # Отправляем отчет администраторам
+            if admin_results:
+                TaskScheduler._notify_admins_about_assignment(admin_results, 'daily')
+            
+            return total_assigned
+            
+        except Exception as e:
+            logger.error(f"Error in assign_daily_tasks: {e}")
+            conn.rollback()
+            return 0
+        finally:
+            cur.close()
+            conn.close()
+    
+    @staticmethod
+    def _assign_admin_daily_tasks(admin_id, admin_name, cursor, today_date):
+        """Выдать ежедневные задания от конкретного администратора на СЕГОДНЯ"""
+        # Получаем активные ежедневные задания администратора
+        cursor.execute("""
+            SELECT task_id, title, due_time, reward 
+            FROM tasks 
+            WHERE type = 'daily' 
+            AND is_active = TRUE 
+            AND created_by = %s
+        """, (admin_id,))
+        
+        daily_tasks = cursor.fetchall()
+        
+        if not daily_tasks:
+            return 0, 0
+        
+        # Получаем всех детей этого администратора
+        cursor.execute("""
+            SELECT user_id, full_name, username 
+            FROM users 
+            WHERE role = 'child' 
+            AND (parent_id = %s OR parent_id IS NULL)
+        """, (admin_id,))
+        
+        children = cursor.fetchall()
+        
+        if not children:
+            return 0, 0
+        
+        assigned_count = 0
+        children_notified = set()
+        
+        for child_id, child_name, child_username in children:
+            child_assigned = 0
+            child_tasks = []
+            
+            for task_id, task_title, due_time, task_reward in daily_tasks:
+                # Задание на СЕГОДНЯ до due_time
+                due_date = datetime.combine(today_date, due_time)
+                
+                # Проверяем, не выдано ли уже задание СЕГОДНЯ
+                cursor.execute("""
+                    SELECT assignment_id FROM assigned_tasks 
+                    WHERE task_id = %s 
+                    AND child_id = %s 
+                    AND assigned_date = CURRENT_DATE
+                """, (task_id, child_id))
+                
+                if not cursor.fetchone():
+                    # Выдаем задание на СЕГОДНЯ
+                    cursor.execute("""
+                        INSERT INTO assigned_tasks 
+                        (task_id, child_id, assigned_date, due_date, is_completed)
+                        VALUES (%s, %s, CURRENT_DATE, %s, FALSE)
+                    """, (task_id, child_id, due_date))
+                    assigned_count += 1
+                    child_assigned += 1
+                    child_tasks.append({
+                        'title': task_title,
+                        'reward': task_reward,
+                        'due_time': due_time
+                    })
+            
+            # Если ребенку назначили задания, отправляем уведомление
+            if child_assigned > 0:
+                if TaskScheduler._notify_child_about_new_tasks(child_id, child_name, child_tasks, 'daily'):
+                    children_notified.add(child_id)
+        
+        return assigned_count, len(children_notified)
+    
+    @staticmethod
+    def assign_weekly_tasks():
+        """Автоматическая выдача еженедельных заданий"""
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        try:
+            logger.info("Starting weekly tasks assignment...")
+            
+            # Проверяем день недели
+            today_weekday = datetime.now().weekday()
+            weekday_map = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+            today_day_name = weekday_map[today_weekday]
+            
+            # Получаем еженедельные задания на сегодня
+            cur.execute("""
+                SELECT DISTINCT t.created_by, u.full_name as admin_name, 
+                       t.task_id, t.title, t.due_time, t.reward
+                FROM tasks t
+                JOIN users u ON t.created_by = u.user_id
+                WHERE t.type = 'weekly' 
+                AND t.is_active = TRUE
+                AND t.due_day = %s
+                AND u.role = 'admin'
+            """, (today_day_name,))
+            
+            weekly_tasks = cur.fetchall()
+            
+            if not weekly_tasks:
+                logger.info(f"No weekly tasks scheduled for {today_day_name}")
+                return 0
+            
+            total_assigned = 0
+            task_results = {}
+            today = date.today()
+            
+            # Группируем задания по администраторам
+            for admin_id, admin_name, task_id, task_title, due_time, task_reward in weekly_tasks:
+                if admin_id not in task_results:
+                    task_results[admin_id] = {
+                        'admin_name': admin_name,
+                        'tasks': [],
+                        'total_assigned': 0,
+                        'children_notified': set()
+                    }
+                
+                task_results[admin_id]['tasks'].append({
+                    'task_id': task_id,
+                    'title': task_title,
+                    'due_time': due_time,
+                    'reward': task_reward
+                })
+            
+            # Выдаем задания для каждого администратора
+            for admin_id, admin_data in task_results.items():
+                try:
+                    assigned, children_notified = TaskScheduler._assign_admin_weekly_tasks(
+                        admin_id, admin_data['admin_name'], admin_data['tasks'], cur, today
+                    )
+                    
+                    admin_data['total_assigned'] = assigned
+                    admin_data['children_notified'] = children_notified
+                    total_assigned += assigned
+                    
+                    logger.info(f"Admin {admin_data['admin_name']} ({admin_id}): {assigned} weekly tasks assigned, {len(children_notified)} children notified")
+                    
+                except Exception as e:
+                    logger.error(f"Error assigning weekly tasks for admin {admin_id}: {e}")
+            
+            # Логируем результат
+            try:
+                cur.execute("""
+                    INSERT INTO task_assignment_logs 
+                    (task_type, assigned_count, success_count, error_count)
+                    VALUES ('weekly', %s, %s, %s)
+                """, (total_assigned, len([a for a in task_results.values() if a['total_assigned'] > 0]), 0))
+            except Exception as e:
+                logger.warning(f"Could not log to task_assignment_logs: {e}")
+            
+            conn.commit()
+            logger.info(f"Weekly tasks assignment completed: {total_assigned} tasks assigned")
+            
+            # Отправляем отчет администраторам
+            successful_admins = [data for data in task_results.values() if data['total_assigned'] > 0]
+            if successful_admins:
+                TaskScheduler._notify_admins_about_assignment(successful_admins, 'weekly')
+            
+            return total_assigned
+            
+        except Exception as e:
+            logger.error(f"Error in assign_weekly_tasks: {e}")
+            conn.rollback()
+            return 0
+        finally:
+            cur.close()
+            conn.close()
+    
+    @staticmethod
+    def _assign_admin_weekly_tasks(admin_id, admin_name, tasks, cursor, today_date):
+        """Выдать еженедельные задания от конкретного администратора"""
+        # Получаем детей этого администратора
+        cursor.execute("""
+            SELECT user_id, full_name, username 
+            FROM users 
+            WHERE role = 'child' 
+            AND (parent_id = %s OR parent_id IS NULL)
+        """, (admin_id,))
+        
+        children = cursor.fetchall()
+        
+        if not children:
+            return 0, set()
+        
+        assigned_count = 0
+        children_notified = set()
+        
+        for child_id, child_name, child_username in children:
+            child_assigned = 0
+            child_tasks_list = []
+            
+            for task in tasks:
+                task_id = task['task_id']
+                
+                # Проверяем, не выдано ли уже задание на этой неделе
+                cursor.execute("""
+                    SELECT assignment_id FROM assigned_tasks 
+                    WHERE task_id = %s 
+                    AND child_id = %s 
+                    AND assigned_date >= DATE_TRUNC('week', CURRENT_DATE)
+                    AND assigned_date < DATE_TRUNC('week', CURRENT_DATE) + INTERVAL '1 week'
+                """, (task_id, child_id))
+                
+                if not cursor.fetchone():
+                    # Рассчитываем due_date (сегодня + due_time)
+                    due_date = datetime.combine(today_date, task['due_time'])
+                    
+                    # Выдаем задание
+                    cursor.execute("""
+                        INSERT INTO assigned_tasks 
+                        (task_id, child_id, assigned_date, due_date, is_completed)
+                        VALUES (%s, %s, CURRENT_DATE, %s, FALSE)
+                    """, (task_id, child_id, due_date))
+                    assigned_count += 1
+                    child_assigned += 1
+                    child_tasks_list.append(task)
+            
+            # Если ребенку назначили задания, отправляем уведомление
+            if child_assigned > 0:
+                if TaskScheduler._notify_child_about_new_tasks(child_id, child_name, child_tasks_list, 'weekly'):
+                    children_notified.add(child_id)
+        
+        return assigned_count, children_notified
+    
+    @staticmethod
+    def _notify_child_about_new_tasks(child_id, child_name, tasks, task_type):
+        """Отправить уведомление ребенку о новых заданиях"""
+        try:
+            if task_type == 'daily':
+                task_emoji = "📅"
+                task_type_text = "ежедневные"
+                greeting = f"Привет, {child_name}! 👋"
+            else:  # weekly
+                task_emoji = "🗓️"
+                task_type_text = "еженедельные"
+                greeting = f"С началом новой недели, {child_name}! ✨"
+            
+            if len(tasks) == 1:
+                task = tasks[0]
+                title = task.get('title', 'Задание')
+                reward = task.get('reward', 0)
+                due_time = task.get('due_time')
+                due_time_str = due_time.strftime('%H:%M') if due_time else "сегодня"
+                
+                message = (
+                    f"{greeting}\n\n"
+                    f"{task_emoji} <b>У тебя новое {task_type_text} задание!</b>\n\n"
+                    f"📋 <b>{title}</b>\n"
+                    f"💰 Награда: <b>{reward} баллов</b>\n"
+                    f"⏰ Выполнить до: <b>{due_time_str}</b>\n\n"
+                    f"Используй команду /tasks чтобы посмотреть все задания!\n"
+                    f"Удачи! 💪"
+                )
+            else:
+                message = (
+                    f"{greeting}\n\n"
+                    f"{task_emoji} <b>У тебя новые {task_type_text} задания!</b>\n\n"
+                    f"📋 <b>Список заданий:</b>\n"
+                )
+                
+                total_reward = 0
+                for i, task in enumerate(tasks, 1):
+                    title = task.get('title', f'Задание {i}')
+                    reward = task.get('reward', 0)
+                    due_time = task.get('due_time')
+                    due_time_str = due_time.strftime('%H:%M') if due_time else ""
+                    time_info = f" (до {due_time_str})" if due_time_str else ""
+                    
+                    message += f"{i}. <b>{title}</b> - {reward} баллов{time_info}\n"
+                    total_reward += reward
+                
+                message += (
+                    f"\n💰 <b>Всего можно получить: {total_reward} баллов</b>\n\n"
+                    f"Используй команду /tasks чтобы посмотреть все задания!\n"
+                    f"Удачи! 💪"
+                )
+            
+            return send_telegram_message(child_id, message)
+            
+        except Exception as e:
+            logger.error(f"Error notifying child {child_id} about new tasks: {e}")
+            return False
+    
+    @staticmethod
+    def _notify_admins_about_assignment(admin_results, task_type):
+        """Отправить отчет администраторам о выданных заданиях"""
+        try:
+            for admin_data in admin_results:
+                if isinstance(admin_data, dict):
+                    admin_id = admin_data.get('admin_id')
+                    admin_name = admin_data.get('admin_name', 'Администратор')
+                    tasks_assigned = admin_data.get('tasks_assigned', 0)
+                    children_notified = admin_data.get('children_notified', 0)
+                    
+                    if task_type == 'daily':
+                        emoji = "📅"
+                        task_text = "ежедневные"
+                    else:
+                        emoji = "🗓️"
+                        task_text = "еженедельные"
+                    
+                    if tasks_assigned > 0:
+                        message = (
+                            f"{emoji} <b>Отчет о выдаче {task_text} заданий</b>\n\n"
+                            f"✅ Задания успешно выданы!\n\n"
+                            f"📊 <b>Статистика:</b>\n"
+                            f"📝 Выдано заданий: {tasks_assigned}\n"
+                            f"👶 Детей получили задания: {children_notified}\n\n"
+                            f"Дети получили уведомления о новых заданиях. 📨"
+                        )
+                        
+                        send_telegram_message(admin_id, message)
+                        
+        except Exception as e:
+            logger.error(f"Error notifying admins about assignment: {e}")
+    
+    @staticmethod
+    def run_scheduled_tasks():
+        """Запустить все запланированные задачи"""
+        logger.info("Starting scheduled tasks assignment...")
+        
+        daily_count = TaskScheduler.assign_daily_tasks()
+        weekly_count = TaskScheduler.assign_weekly_tasks()
+        
+        total_count = daily_count + weekly_count
+        
+        logger.info(f"Scheduled tasks completed: {daily_count} daily, {weekly_count} weekly, total: {total_count}")
+        
+        return {
+            'daily': daily_count,
+            'weekly': weekly_count,
+            'total': total_count
+        }
